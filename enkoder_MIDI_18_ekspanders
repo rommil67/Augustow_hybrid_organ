@@ -1,0 +1,179 @@
+/*
+  Program nie sprawdzony - obsługa 18 układów MCP23017
+  5x Software I2C + MCP23017 -> MIDI encoder (W Organach Piszczałkowych)
+  Piny par I2C: (SDA,SCL) = (6,7), (8,9), (10,11), (12,13), (14,15)
+  MIDI TX: Serial2 (D16), 31250 baud
+  Autor: (Romuald Milewski)
+
+  Wymaga: SoftwareWire (by Testato/Naguissa i in.)
+
+*/
+
+#include <SoftwareWire.h>
+
+// -------------------------- KONFIGURACJA --------------------------
+
+// Pary pinów dla 5 szyn Soft-I2C (SDA,SCL)
+SoftwareWire WireA(6, 7);
+SoftwareWire WireB(8, 9);
+SoftwareWire WireC(10, 11);
+SoftwareWire WireD(12, 13);
+SoftwareWire WireE(14, 15);
+
+// Ile ekspanderów MCP23017 jest na każdej szynie (4,4,4,4,2)
+const uint8_t BUS_COUNTS[5] = {4, 4, 4, 4, 2};
+
+// Kanał MIDI dla każdej szyny (1..16)
+const uint8_t BUS_MIDI_CH[5] = {1, 2, 3, 4, 5};
+
+// Adres bazowy MCP23017 (0x20) – w obrębie każdej szyny kolejne moduły mają adresy 0x20,0x21,...
+const uint8_t MCP_BASE_ADDR = 0x20;
+
+// Mapa nut – startowa nuta dla pierwszego modułu na danej szynie.
+// Każdy MCP23017 dodaje 16 kolejnych nut.
+const uint8_t BUS_BASE_NOTE[5] = {
+  36,  // szyna A (np. manual I)  C2
+  36,  // szyna B (manual II)
+  36,  // szyna C (manual III)
+  36,  // szyna D (manual IV)
+  36   // szyna E (np. pedał / manual V) – zmień według potrzeb
+};
+
+// Szybkość Soft-I2C (opcja biblioteki SoftwareWire – bezpiecznie zostawić domyślną)
+const uint16_t SCAN_INTERVAL_MS = 2;   // skan co ~2 ms
+const uint8_t  MIDI_VELOCITY_ON = 100; // stała prędkość NoteOn
+
+// ---------------------- Rejestry MCP23017 -------------------------
+#define IODIRA  0x00
+#define IODIRB  0x01
+#define GPPUA   0x0C
+#define GPPUB   0x0D
+#define GPIOA   0x12
+#define GPIOB   0x13
+#define IPOLA   0x02
+#define IPOLB   0x03
+
+// ---------------------- Pomocnicze struktury ----------------------
+struct Bus {
+  SoftwareWire* w;     // wskaźnik do instancji SoftwareWire
+  uint8_t count;       // ile MCP na tej szynie
+  uint8_t midiCh;      // kanał MIDI (1..16)
+  uint8_t baseNote;    // pierwsza nuta dla modułu o adresie 0x20
+};
+
+// Tabela pięciu szyn
+Bus BUSES[5] = {
+  { &WireA, BUS_COUNTS[0], BUS_MIDI_CH[0], BUS_BASE_NOTE[0] },
+  { &WireB, BUS_COUNTS[1], BUS_MIDI_CH[1], BUS_BASE_NOTE[1] },
+  { &WireC, BUS_COUNTS[2], BUS_MIDI_CH[2], BUS_BASE_NOTE[2] },
+  { &WireD, BUS_COUNTS[3], BUS_MIDI_CH[3], BUS_BASE_NOTE[3] },
+  { &WireE, BUS_COUNTS[4], BUS_MIDI_CH[4], BUS_BASE_NOTE[4] }
+};
+
+// Bufor poprzednich stanów (po 16 bitów na moduł)
+uint16_t prevState[5][8]; // max 8 ekspanderów na szynę – tu wystarczy (u Ciebie do 4/2)
+
+// ---------------------- Funkcje MCP23017 --------------------------
+void mcpWrite(SoftwareWire &w, uint8_t addr, uint8_t reg, uint8_t val) {
+  w.beginTransmission(addr);
+  w.write(reg);
+  w.write(val);
+  w.endTransmission();
+}
+
+uint16_t mcpRead16(SoftwareWire &w, uint8_t addr) {
+  // czytamy A i B za jednym zamachem
+  w.beginTransmission(addr);
+  w.write(GPIOA);
+  w.endTransmission();
+  w.requestFrom(addr, (uint8_t)2);
+  uint8_t a = w.read();
+  uint8_t b = w.read();
+  return (uint16_t)b << 8 | a; // B to bity 8..15, A to 0..7
+}
+
+void mcpInitAsInputsPullup(SoftwareWire &w, uint8_t addr) {
+  // Wszystkie jako wejścia
+  mcpWrite(w, addr, IODIRA, 0xFF);
+  mcpWrite(w, addr, IODIRB, 0xFF);
+  // Pull-upy włączone – bo klawisze zwierają do GND
+  mcpWrite(w, addr, GPPUA, 0xFF);
+  mcpWrite(w, addr, GPPUB, 0xFF);
+  // Nie odwracamy polaryzacji (czytamy LOW jako 0 i odwracamy w kodzie)
+  mcpWrite(w, addr, IPOLA, 0x00);
+  mcpWrite(w, addr, IPOLB, 0x00);
+}
+
+// ---------------------- MIDI --------------------------
+inline void midiNoteOn(uint8_t ch, uint8_t note, uint8_t vel) {
+  Serial2.write(0x90 | ((ch - 1) & 0x0F));
+  Serial2.write(note);
+  Serial2.write(vel);
+}
+inline void midiNoteOff(uint8_t ch, uint8_t note) {
+  // Note Off można wysłać jako NoteOn z vel=0 (kompatybilne)
+  Serial2.write(0x90 | ((ch - 1) & 0x0F));
+  Serial2.write(note);
+  Serial2.write((uint8_t)0);
+}
+
+// ---------------------- SETUP --------------------------
+void setup() {
+  // start pięciu Soft-I2C
+  for (int i = 0; i < 5; i++) {
+    BUSES[i].w->begin();
+  }
+
+  // Inicjalizacja wszystkich MCP na wszystkich szynach
+  for (int b = 0; b < 5; b++) {
+    for (uint8_t k = 0; k < BUSES[b].count; k++) {
+      uint8_t addr = MCP_BASE_ADDR + k;
+      mcpInitAsInputsPullup(*BUSES[b].w, addr);
+      prevState[b][k] = mcpRead16(*BUSES[b].w, addr); // pierwszy odczyt
+    }
+  }
+
+  // MIDI na D16 (TX2)
+  Serial2.begin(31250);
+}
+
+// ---------------------- LOOP --------------------------
+void loop() {
+  static uint32_t lastScan = 0;
+  uint32_t now = millis();
+  if (now - lastScan < SCAN_INTERVAL_MS) return;
+  lastScan = now;
+
+  for (int b = 0; b < 5; b++) {
+    SoftwareWire &w = *BUSES[b].w;
+    const uint8_t ch = BUSES[b].midiCh;
+
+    for (uint8_t k = 0; k < BUSES[b].count; k++) {
+      uint8_t addr = MCP_BASE_ADDR + k;
+
+      uint16_t raw = mcpRead16(w, addr);
+      // aktywne niskim -> odwracamy, żeby "1" = wciśnięty
+      uint16_t state = ~raw;
+
+      uint16_t changed = state ^ prevState[b][k];
+      if (changed) {
+        // każda jedynka w 'changed' to zmiana stanu danego bitu
+        for (uint8_t bit = 0; bit < 16; bit++) {
+          if (changed & (1 << bit)) {
+            bool pressed = state & (1 << bit);
+
+            // wyliczenie nuty: baza dla szyny + 16*k (kolejny MCP) + nr bitu
+            uint8_t note = BUSES[b].baseNote + 16 * k + bit;
+            if (pressed) {
+              midiNoteOn(ch, note, MIDI_VELOCITY_ON);
+            } else {
+              midiNoteOff(ch, note);
+            }
+          }
+        }
+        prevState[b][k] = state;
+      }
+    }
+  }
+}
+
